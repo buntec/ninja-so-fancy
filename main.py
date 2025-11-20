@@ -1,0 +1,680 @@
+#!/usr/bin/env -S uv run --script
+#
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["rich", "watchfiles", "psutil"]
+# ///
+
+
+import argparse
+import asyncio
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+from asyncio import Event, Queue
+from dataclasses import dataclass
+from enum import IntEnum, StrEnum
+
+import psutil
+import watchfiles
+from rich.console import Console
+from rich.progress import BarColumn, Progress, TaskID, TaskProgressColumn, TextColumn, TimeElapsedColumn
+from watchfiles import awatch
+
+WATCH_DIRS = False  # not really needed and may cause "too many open files" errors
+PROCESS_TREE_CHECK_INTERVAL = 0.25  # in seconds
+MAX_PATH_LENGTH = 50  # certain paths will be shortened to this length for display purposes
+MAX_LINE_LENGTH = 320  # certain lines will be shortened to this length to reduce clutter
+
+
+class Severity(IntEnum):
+    NOTE = 1
+    WARNING = 2
+    ERROR = 3
+    FATAL_ERROR = 4
+
+
+def severity_from_string(s: str) -> Severity:
+    match s.strip().lower():
+        case "note":
+            return Severity.NOTE
+        case "warning":
+            return Severity.WARNING
+        case "error":
+            return Severity.ERROR
+        case "fatal error":
+            return Severity.FATAL_ERROR
+    raise ValueError(f'Cannot parse "{s}" to Severity')
+
+
+def shorten_path(path: str) -> str:
+    path = os.path.normpath(path)
+    parts = path.split(os.sep)
+    path_short = path
+    m = 0
+    while len(path_short) > MAX_PATH_LENGTH:
+        m += 1
+        if m >= len(parts):
+            return f"...{path_short[-(MAX_PATH_LENGTH - 3) :]}"
+        parts_shortened = [part[0] if part and i < m else part for i, part in enumerate(parts)]
+        path_short = os.sep.join(parts_shortened)
+    return path_short
+
+
+def shorten_string(s: str, maxlen: int) -> str:
+    if len(s) > maxlen:
+        return f"{s[: maxlen - 3]}..."
+    return s
+
+
+class NinjaStoppedException(Exception):
+    def __init__(self, reason: str | int | None):
+        self.reason = reason
+
+    """Exception raised to signal that ninja has stopped."""
+
+
+class ProgressKind(StrEnum):
+    BUILDING = "building"
+    LINKING_EXE = "linking executable"
+    LINKING_SHARED_LIB = "linking shared library"
+    LINKING_STATIC_LIB = "linking static library"
+
+
+@dataclass
+class ProcInfo:
+    pid: int
+    name: str
+    cmd: str
+    status: str
+    create_time: float
+
+
+@dataclass
+class ProgressLine:
+    out_path: str
+    count_current: int
+    count_total: int
+    kind: ProgressKind
+
+
+@dataclass
+class CompilerLine:
+    source_path: str
+    line: int
+    column: int
+    severity: Severity
+    message: list[str]
+
+
+@dataclass
+class FailureLine:
+    code: int
+    out_path: str
+
+
+@dataclass
+class NinjaStoppedLine:
+    reason: str
+    error: bool
+
+
+@dataclass
+class RawLine:
+    output: str
+
+
+type OutputLine = ProgressLine | CompilerLine | FailureLine | NinjaStoppedLine | RawLine
+
+
+@dataclass
+class ParsingCompilerMessage:
+    line: CompilerLine
+
+
+@dataclass
+class ParsingFailureMessage:
+    out_path: str
+    lines: list[str]
+
+
+type ParserState = ParsingCompilerMessage | ParsingFailureMessage | None
+
+
+@dataclass
+class BuildingObject:
+    start_time: float
+    out_path: str
+    count_current: int | None
+    count_total: int | None
+    kind: ProgressKind
+
+
+@dataclass
+class FinishedObject:
+    out_path: str
+    time: float
+
+
+@dataclass
+class FileChange:
+    path: str
+    time: float
+
+
+@dataclass
+class NinjaStopped:
+    reason: str
+    error: bool
+
+
+@dataclass
+class NinjaExited:
+    exit_code: int
+
+
+@dataclass(eq=True, frozen=True)
+class CompilerDiagnostic:
+    source_path: str
+    line: int
+    column: int
+    severity: Severity
+    message: str
+
+
+@dataclass
+class ErrorMessage:
+    out_path: str
+    lines: list[str]
+
+
+type Message = CompilerDiagnostic | ErrorMessage | BuildingObject | FinishedObject | FileChange | NinjaStopped | NinjaExited
+
+
+@dataclass
+class NinjaTask:
+    out_path: str
+    start_time: float
+    end_time: float | None
+    kind: ProgressKind
+
+
+@dataclass
+class AppState:
+    root_dir: str
+    tasks: dict[str, NinjaTask]
+    diagnostics: list[CompilerDiagnostic]
+    error_messages: list[ErrorMessage]
+    watched_dirs: set[str]
+    count_current: int | None
+    count_total: int | None
+    stopped: bool
+    stopped_reason: str | int | None
+    stopped_error: bool
+
+
+Q: Queue[Message] = Queue(100)
+S = AppState(".", {}, [], [], set(), None, None, False, None, False)
+
+ev_state_changed = Event()
+
+console = Console(soft_wrap=True)
+
+
+def get_process_tree(parent_pid):
+    try:
+        parent = psutil.Process(parent_pid)
+        children = parent.children(recursive=True)
+        return children
+    except psutil.NoSuchProcess:
+        return []
+
+
+def extract_process_info(proc) -> ProcInfo | None:
+    try:
+        return ProcInfo(proc.pid, proc.name(), " ".join(proc.cmdline()), proc.status(), proc.create_time())
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return None
+
+
+def outfile_from_cmd(cmd: str) -> str | None:
+    pattern = r"-o\s+(\S+)"
+    match = re.search(pattern, cmd)
+    if match:
+        return match.group(1)
+
+
+def progress_kind_from_cmd(cmd: str) -> ProgressKind | None:
+    out_path = outfile_from_cmd(cmd)
+    if out_path is not None:
+        if out_path.endswith(".o"):
+            return ProgressKind.BUILDING
+        elif out_path.endswith(".so") or out_path.endswith(".dylib"):
+            return ProgressKind.LINKING_SHARED_LIB
+        elif out_path.endswith(".a"):
+            return ProgressKind.LINKING_STATIC_LIB
+        else:
+            return ProgressKind.LINKING_EXE
+
+
+async def monitor_process_tree(parent_pid: int):
+    seen_pids: dict[int, ProcInfo | None] = {parent_pid: None}
+
+    while True:
+        try:
+            parent = psutil.Process(parent_pid)
+            if not parent.is_running():
+                break
+        except psutil.NoSuchProcess:
+            break
+
+        children = get_process_tree(parent_pid)
+
+        for child in children:
+            if child.pid not in seen_pids:
+                info = extract_process_info(child)
+                if info is not None:
+                    seen_pids[child.pid] = info
+                    out_path = outfile_from_cmd(info.cmd)
+                    kind = progress_kind_from_cmd(info.cmd)
+                    if (out_path is not None) and (not out_path.endswith(".ii")) and (kind is not None):
+                        await Q.put(BuildingObject(info.create_time, out_path, None, None, kind))
+                    else:
+                        # print(f"ignoring child process: {info}")
+                        pass
+                else:
+                    seen_pids[child.pid] = None
+
+        for pid, info in seen_pids.items():
+            if info is not None:
+                try:
+                    child = psutil.Process(pid)
+                    if not child.is_running():
+                        out_path = outfile_from_cmd(info.cmd)
+                        if out_path is not None:
+                            await Q.put(FinishedObject(out_path, time.time()))
+                except psutil.NoSuchProcess:
+                    out_path = outfile_from_cmd(info.cmd)
+                    if out_path is not None:
+                        await Q.put(FinishedObject(out_path, time.time()))
+
+        await asyncio.sleep(PROCESS_TREE_CHECK_INTERVAL)
+
+
+async def watch_dir(path: str):
+    pathlib.Path(path).mkdir(parents=True, exist_ok=True)
+    async for changes in awatch(path, recursive=False):
+        for change in changes:
+            change_type, change_path = change
+            if change_type == watchfiles.Change.added or change_type == watchfiles.Change.modified:
+                await Q.put(FileChange(change_path, time.time()))
+
+
+async def handle_messages():
+    while True:
+        msg = await Q.get()
+        match msg:
+            case BuildingObject(start_time, out_path, count_current, count_total, kind):
+                if not os.path.isabs(out_path):
+                    out_path = os.path.join(S.root_dir, out_path)
+                if WATCH_DIRS:
+                    dir = os.path.dirname(out_path)
+                    if dir not in S.watched_dirs:
+                        asyncio.create_task(watch_dir(dir))
+                        S.watched_dirs.add(dir)
+                m_time = None
+                if os.path.exists(out_path):
+                    m_time = os.path.getmtime(out_path)
+                if m_time is not None and m_time > start_time - 3:
+                    S.tasks[out_path] = NinjaTask(out_path, start_time, max(m_time, start_time), kind)
+                else:
+                    S.tasks[out_path] = NinjaTask(out_path, start_time, None, kind)
+                if count_current is not None:
+                    S.count_current = count_current
+                if count_total is not None:
+                    S.count_total = count_total
+                ev_state_changed.set()
+            case FileChange(file_path, time):
+                if not os.path.isabs(file_path):
+                    file_path = os.path.join(S.root_dir, file_path)
+                if file_path in S.tasks:
+                    task = S.tasks[file_path]
+                    if (task.end_time is None) and (time > task.start_time - 3):
+                        task.end_time = max(task.start_time, time)
+                        ev_state_changed.set()
+            case CompilerDiagnostic() as cd:
+                S.diagnostics.append(cd)
+                ev_state_changed.set()
+            case ErrorMessage() as msg:
+                S.error_messages.append(msg)
+                ev_state_changed.set()
+            case FinishedObject(out_path, time):
+                if not os.path.isabs(out_path):
+                    out_path = os.path.join(S.root_dir, out_path)
+                if out_path in S.tasks:
+                    task = S.tasks[out_path]
+                    if task.end_time is None:
+                        task.end_time = max(task.start_time, time)
+                        ev_state_changed.set()
+            case NinjaStopped(reason, is_error):
+                S.stopped = True
+                S.stopped_reason = reason
+                S.stopped_error = is_error
+                ev_state_changed.set()
+            case NinjaExited(exit_code):
+                S.stopped = True
+                S.stopped_reason = exit_code
+                S.stopped_error = exit_code != 0
+                ev_state_changed.set()
+
+
+def parse_line(line: str) -> OutputLine:
+    if "ninja: no work to do" in line:
+        return NinjaStoppedLine("no work to do", False)
+
+    pattern = r"^ninja:\s+error:\s+(.+)$"
+    match = re.search(pattern, line)
+    if match:
+        error_msg = match.group(1).strip()
+        return NinjaStoppedLine(error_msg, True)
+
+    pattern = r"^ninja:\s+build stopped:\s+(.+)\.$"
+    match = re.search(pattern, line)
+    if match:
+        reason = match.group(1).strip()
+        return NinjaStoppedLine(reason, True)
+
+    # extract progress and filepath from Ninja build output
+    pattern = r"\[(\d+)/(\d+)\]\s+(.+)$"
+    match = re.search(pattern, line)
+    if match:
+        current = match.group(1)
+        total = match.group(2)
+        cmd = match.group(3).strip()
+        outfile = outfile_from_cmd(cmd)
+        kind = progress_kind_from_cmd(cmd)
+
+        if outfile is not None and kind is not None:
+            return ProgressLine(outfile.strip(), int(current), int(total), kind)
+        # print(f"ignoring progess line: {line}")
+
+    # extract components from compiler error/warning messages
+    pattern = r"^(.+?):(\d+):(\d+):\s+(fatal error|error|warning|note):\s+(.+)$"
+    match = re.search(pattern, line)
+    if match:
+        filepath = match.group(1).strip()
+        line_num = match.group(2)
+        col_num = match.group(3)
+        severity = match.group(4)
+        message = match.group(5).strip()
+        return CompilerLine(filepath, int(line_num), int(col_num), severity_from_string(severity), [message])
+
+    # extract error code and filepath from "FAILED" messages
+    pattern = r"^FAILED:\s+\[code=(\d+)\]\s+([\w/\-\.]+)(.*)$"
+    match = re.search(pattern, line)
+    if match:
+        error_code = match.group(1)
+        filepath = match.group(2).strip()
+        return FailureLine(int(error_code), filepath)
+
+    return RawLine(line)
+
+
+async def process_line(state: ParserState, line: OutputLine) -> ParserState:
+    match line:
+        case CompilerLine() as cl:
+            match state:
+                case ParsingCompilerMessage(m):
+                    await Q.put(CompilerDiagnostic(m.source_path, m.line, m.column, m.severity, "\n".join(m.message)))
+                case ParsingFailureMessage(out_path, lines):
+                    await Q.put(ErrorMessage(out_path, lines))
+            return ParsingCompilerMessage(cl)
+        case RawLine() as rl:
+            match state:
+                case ParsingCompilerMessage(m):
+                    m.message.append(rl.output)
+                case ParsingFailureMessage(m, lines):
+                    lines.append(rl.output)
+            return state
+        case FailureLine(_, out_path):
+            match state:
+                case ParsingCompilerMessage(m):
+                    await Q.put(CompilerDiagnostic(m.source_path, m.line, m.column, m.severity, "\n".join(m.message)))
+                case ParsingFailureMessage(out_path, lines):
+                    await Q.put(ErrorMessage(out_path, lines))
+            return ParsingFailureMessage(out_path, [])
+        case ProgressLine(out_path, count_current, count_total, kind):
+            match state:
+                case ParsingCompilerMessage(m):
+                    await Q.put(CompilerDiagnostic(m.source_path, m.line, m.column, m.severity, "\n".join(m.message)))
+                case ParsingFailureMessage(out_path, lines):
+                    await Q.put(ErrorMessage(out_path, lines))
+            if not os.path.isabs(out_path):
+                out_path = os.path.join(S.root_dir, out_path)
+            await Q.put(BuildingObject(time.time(), out_path, count_current, count_total, kind))
+            return None
+        case NinjaStoppedLine(reason, is_error):
+            match state:
+                case ParsingCompilerMessage(m):
+                    await Q.put(CompilerDiagnostic(m.source_path, m.line, m.column, m.severity, "\n".join(m.message)))
+                case ParsingFailureMessage(out_path, lines):
+                    await Q.put(ErrorMessage(out_path, lines))
+            await Q.put(NinjaStopped(reason, is_error))
+            return None
+
+
+async def read_stream(stream, stream_name):
+    state = None
+
+    try:
+        while True:
+            line = await stream.readline()
+
+            # Empty line means EOF
+            if not line:
+                break
+
+            text: str = line.decode("utf-8").rstrip("\n\r")
+
+            # print(f"[{stream_name}] {text}")
+            # sys.stdout.flush()
+
+            state = await process_line(state, parse_line(text))
+
+    except Exception as e:
+        print(f"Error reading {stream_name}: {e}", file=sys.stderr)
+
+
+async def run_subprocess(command):
+    # console.print(f"running ninja: {' '.join(command)}")
+
+    try:
+        process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        pid: int = process.pid
+        await asyncio.gather(read_stream(process.stdout, "STDOUT"), monitor_process_tree(pid))
+        exit_code = await process.wait()
+        await Q.put(NinjaExited(exit_code))
+
+    except Exception as e:
+        print(f"Error running subprocess: {e}", file=sys.stderr)
+
+
+def keep_task_after_finish(task: NinjaTask) -> bool:
+    return task.kind != ProgressKind.BUILDING and pathlib.PurePath(task.out_path).is_relative_to(S.root_dir)
+
+
+async def render():
+    columns = [TextColumn("[progress.description]{task.description}"), BarColumn(bar_width=10), TaskProgressColumn(), TimeElapsedColumn()]
+    task_ids: dict[str, TaskID] = {}
+    with Progress(*columns, console=console) as progress:
+        diags_seen: set[CompilerDiagnostic] = set()
+        errors_seen: set[str] = set()
+
+        max_severity_seen = Severity.NOTE
+
+        id0 = progress.add_task("🥷", total=None)
+
+        while True:
+            await ev_state_changed.wait()
+
+            for diag in S.diagnostics:
+                if diag not in diags_seen:
+                    diags_seen.add(diag)
+                    max_severity_seen = max(max_severity_seen, diag.severity)
+                    match diag.severity:
+                        case Severity.FATAL_ERROR:
+                            console.print(f"🛑 [red]{diag.source_path} {diag.line}:{diag.column}")
+                            console.print(f"[bold red]fatal error[/bold red]: {diag.message}")
+                            console.line()
+                        case Severity.ERROR:
+                            console.print(f"‼️ [red]{diag.source_path} {diag.line}:{diag.column}")
+                            console.print(f"[bold red]error[/bold red]: {diag.message}")
+                            console.line()
+                        case Severity.WARNING:
+                            console.print(f"⚠️ [yellow]{diag.source_path} {diag.line}:{diag.column}")
+                            console.print(f"[bold yellow]warning[/bold yellow]: {diag.message}")
+                            console.line()
+                        case Severity.NOTE:
+                            console.print(f"💡 [magenta]{diag.source_path} {diag.line}:{diag.column}")
+                            console.print(f"[bold magenta]note[/bold magenta]: {diag.message}")
+                            console.line()
+
+            for em in S.error_messages:
+                m = "\n".join([shorten_string(line, MAX_LINE_LENGTH) for line in em.lines])
+                if m not in errors_seen:
+                    errors_seen.add(m)
+                    # after the first compile error, we skip printing non-compiler errors for readability.
+                    if max_severity_seen < Severity.ERROR:
+                        console.print(f"‼️ [red]{em.out_path}")
+                        console.print(m)
+                        console.line()
+
+            progress.update(id0, total=S.count_total, completed=S.count_current)
+
+            for out_path, task in S.tasks.items():
+                if out_path not in task_ids:
+                    match task.kind:
+                        case ProgressKind.BUILDING:
+                            task_ids[out_path] = progress.add_task(f"🛠️ {shorten_path(os.path.relpath(out_path, S.root_dir))}", total=None)
+                        case ProgressKind.LINKING_EXE:
+                            task_ids[out_path] = progress.add_task(f"⚡️ {shorten_path(os.path.relpath(out_path, S.root_dir))}", total=None)
+                        case ProgressKind.LINKING_SHARED_LIB:
+                            task_ids[out_path] = progress.add_task(f"📚 {shorten_path(os.path.relpath(out_path, S.root_dir))}", total=None)
+                        case ProgressKind.LINKING_STATIC_LIB:
+                            task_ids[out_path] = progress.add_task(f"📚 {shorten_path(os.path.relpath(out_path, S.root_dir))}", total=None)
+
+                tid = task_ids[out_path]
+
+                if tid in progress.task_ids:
+                    if task.end_time is not None:
+                        progress.update(tid, total=100, completed=100, refresh=True)
+                        if not keep_task_after_finish(task):
+                            progress.remove_task(tid)
+
+            if S.stopped:
+                if not S.stopped_error:
+                    for out_path, task in S.tasks.items():
+                        tid = task_ids[out_path]
+                        if tid in progress.task_ids:
+                            progress.update(tid, total=100, completed=100, refresh=True)
+                            if not keep_task_after_finish(task):
+                                progress.remove_task(tid)
+                progress.remove_task(id0)
+                break
+
+            ev_state_changed.clear()
+
+    if len(task_ids) > 0:
+        console.line()
+    raise NinjaStoppedException(S.stopped_reason)
+
+
+async def main_async():
+    ninja_args = sys.argv[1:]
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "-C",
+        help="change to DIR before doing anything else",
+        metavar="DIR",
+    )
+
+    parser.add_argument(
+        "-f",
+        help="specify the input build file [default=build.ninja]",
+        metavar="FILE",
+    )
+
+    parser.add_argument("--version", action="store_true")
+
+    args, _ = parser.parse_known_args()
+
+    try:
+        ninja_proc = subprocess.run(["ninja", "--version"], capture_output=True)
+        ninja_version = ninja_proc.stdout.decode("utf-8").strip()
+    except FileNotFoundError:
+        print("error: ninja executable not found")
+        return 1
+    except Exception as ex:
+        print("failed to invoke `ninja --version`; be sure a recent version of ninja is on your PATH!")
+        print(f"error message: {ex}")
+        return 1
+
+    ninja_version_match = re.search(r"(\d+)\.(\d+)\.(\w+)", ninja_version)
+    if ninja_version_match:
+        major = int(ninja_version_match.group(1))
+        minor = int(ninja_version_match.group(2))
+        # patch = ninja_version_match.group(3)
+        if (major < 1) or (major < 2 and minor < 10):
+            print(f"warning: old version of ninja detected: {ninja_version}")
+    else:
+        print("output of `ninja --version` doesn't have expected format.")
+        return 1
+
+    # intercept the --version flag so that CMake accepts
+    # this as a ninja executable
+
+    if args.version:
+        print(ninja_version)
+        return 0
+
+    S.root_dir = os.getcwd()
+
+    if args.C is not None:
+        S.root_dir = os.path.abspath(args.C)
+
+    if args.f is not None:
+        S.root_dir = os.path.dirname(os.path.abspath(args.f))
+
+    try:
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(run_subprocess(["ninja", "-v", *ninja_args]))
+            tg.create_task(handle_messages())
+            tg.create_task(render())
+    except* NinjaStoppedException:
+        pass
+    except* Exception as e:
+        print(f"exception in task group: {e.exceptions}")
+    finally:
+        if S.stopped_reason:
+            if S.stopped_error:
+                console.print(f"🥷 [red]failed ({S.stopped_reason}).")
+            else:
+                console.print(f"🥷 [green]finished ({S.stopped_reason}).")
+        else:
+            if S.stopped_error:
+                console.print("🥷 [red]failed.")
+            else:
+                console.print("🥷 [green]finished.")
+
+
+def main():
+    asyncio.run(main_async())
+
+
+if __name__ == "__main__":
+    main()
