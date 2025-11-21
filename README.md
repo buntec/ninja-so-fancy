@@ -15,7 +15,7 @@ You need:
 
 ```sh
 # to install
-uv tool install git:http://github.com/buntec/ninja-so-fancy
+uv tool install git+http://github.com/buntec/ninja-so-fancy
 
 # to update
 uv tool upgrade ninja-so-fancy
