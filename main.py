@@ -8,6 +8,7 @@
 
 import argparse
 import asyncio
+import logging
 import os
 import pathlib
 import re
@@ -17,6 +18,7 @@ import time
 from asyncio import Event, Queue
 from dataclasses import dataclass
 from enum import IntEnum, StrEnum
+from pathlib import Path, PurePath
 
 import psutil
 import watchfiles
@@ -24,10 +26,21 @@ from rich.console import Console
 from rich.progress import BarColumn, Progress, TaskID, TaskProgressColumn, TextColumn, TimeElapsedColumn
 from watchfiles import awatch
 
-WATCH_DIRS = False  # not really needed and may cause "too many open files" errors
-PROCESS_TREE_CHECK_INTERVAL = 0.25  # in seconds
-MAX_PATH_LENGTH = 50  # certain paths will be shortened to this length for display purposes
-MAX_LINE_LENGTH = 320  # certain lines will be shortened to this length to reduce clutter
+logger = logging.getLogger(__name__)
+
+APP_DIR = Path.home() / ".local" / "share" / "ninja-so-fancy"
+
+# not really needed and may cause "too many open files" errors
+WATCH_DIRS = False
+
+# in seconds
+PROCESS_TREE_CHECK_INTERVAL = float(os.environ.get("NINJASOFANCY_PROCESS_TREE_CHECK_INTERVAL", "0.25"))
+
+# certain paths will be shortened to this length for display purposes
+MAX_PATH_LENGTH = int(os.environ.get("NINJASOFANCY_MAX_PATH_LENGTH", "50"))
+
+# certain lines will be shortened to this length to reduce clutter
+MAX_LINE_LENGTH = int(os.environ.get("NINJASOFANCY_MAX_LINE_LENGTH", "320"))
 
 
 class Severity(IntEnum):
@@ -37,51 +50,16 @@ class Severity(IntEnum):
     FATAL_ERROR = 4
 
 
-def severity_from_string(s: str) -> Severity:
-    match s.strip().lower():
-        case "note":
-            return Severity.NOTE
-        case "warning":
-            return Severity.WARNING
-        case "error":
-            return Severity.ERROR
-        case "fatal error":
-            return Severity.FATAL_ERROR
-    raise ValueError(f'Cannot parse "{s}" to Severity')
-
-
-def shorten_path(path: str) -> str:
-    path = os.path.normpath(path)
-    parts = path.split(os.sep)
-    path_short = path
-    m = 0
-    while len(path_short) > MAX_PATH_LENGTH:
-        m += 1
-        if m >= len(parts):
-            return f"...{path_short[-(MAX_PATH_LENGTH - 3) :]}"
-        parts_shortened = [part[0] if part and i < m else part for i, part in enumerate(parts)]
-        path_short = os.sep.join(parts_shortened)
-    return path_short
-
-
-def shorten_string(s: str, maxlen: int) -> str:
-    if len(s) > maxlen:
-        return f"{s[: maxlen - 3]}..."
-    return s
-
-
-class NinjaStoppedException(Exception):
-    def __init__(self, reason: str | int | None):
-        self.reason = reason
-
-    """Exception raised to signal that ninja has stopped."""
-
-
 class ProgressKind(StrEnum):
     BUILDING = "building"
     LINKING_EXE = "linking executable"
     LINKING_SHARED_LIB = "linking shared library"
     LINKING_STATIC_LIB = "linking static library"
+
+
+class NinjaStoppedException(Exception):
+    def __init__(self, reason: str | int | None):
+        self.reason = reason
 
 
 @dataclass
@@ -217,6 +195,7 @@ class AppState:
 
 
 Q: Queue[Message] = Queue(100)
+
 S = AppState(".", {}, [], [], set(), None, None, False, None, False)
 
 ev_state_changed = Event()
@@ -224,7 +203,40 @@ ev_state_changed = Event()
 console = Console(soft_wrap=True)
 
 
-def get_process_tree(parent_pid):
+def severity_from_string(s: str) -> Severity:
+    match s.strip().lower():
+        case "note":
+            return Severity.NOTE
+        case "warning":
+            return Severity.WARNING
+        case "error":
+            return Severity.ERROR
+        case "fatal error":
+            return Severity.FATAL_ERROR
+    raise ValueError(f'Cannot parse "{s}" to Severity')
+
+
+def shorten_path(path: str) -> str:
+    path = os.path.normpath(path)
+    parts = path.split(os.sep)
+    path_short = path
+    m = 0
+    while len(path_short) > MAX_PATH_LENGTH:
+        m += 1
+        if m >= len(parts):
+            return f"...{path_short[-(MAX_PATH_LENGTH - 3) :]}"
+        parts_shortened = [part[0] if part and i < m else part for i, part in enumerate(parts)]
+        path_short = os.sep.join(parts_shortened)
+    return path_short
+
+
+def shorten_string(s: str, maxlen: int) -> str:
+    if len(s) > maxlen:
+        return f"{s[: maxlen - 3]}..."
+    return s
+
+
+def get_process_tree(parent_pid: int) -> list[psutil.Process]:
     try:
         parent = psutil.Process(parent_pid)
         children = parent.children(recursive=True)
@@ -233,7 +245,7 @@ def get_process_tree(parent_pid):
         return []
 
 
-def extract_process_info(proc) -> ProcInfo | None:
+def extract_process_info(proc: psutil.Process) -> ProcInfo | None:
     try:
         return ProcInfo(proc.pid, proc.name(), " ".join(proc.cmdline()), proc.status(), proc.create_time())
     except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -260,7 +272,7 @@ def progress_kind_from_cmd(cmd: str) -> ProgressKind | None:
             return ProgressKind.LINKING_EXE
 
 
-async def monitor_process_tree(parent_pid: int):
+async def monitor_process_tree(parent_pid: int) -> None:
     seen_pids: dict[int, ProcInfo | None] = {parent_pid: None}
 
     while True:
@@ -283,8 +295,7 @@ async def monitor_process_tree(parent_pid: int):
                     if (out_path is not None) and (not out_path.endswith(".ii")) and (kind is not None):
                         await Q.put(BuildingObject(info.create_time, out_path, None, None, kind))
                     else:
-                        # print(f"ignoring child process: {info}")
-                        pass
+                        logger.debug(f"ignoring child process: {info}")
                 else:
                     seen_pids[child.pid] = None
 
@@ -304,7 +315,7 @@ async def monitor_process_tree(parent_pid: int):
         await asyncio.sleep(PROCESS_TREE_CHECK_INTERVAL)
 
 
-async def watch_dir(path: str):
+async def watch_dir(path: str) -> None:
     pathlib.Path(path).mkdir(parents=True, exist_ok=True)
     async for changes in awatch(path, recursive=False):
         for change in changes:
@@ -313,7 +324,7 @@ async def watch_dir(path: str):
                 await Q.put(FileChange(change_path, time.time()))
 
 
-async def handle_messages():
+async def handle_messages() -> None:
     while True:
         msg = await Q.get()
         match msg:
@@ -399,7 +410,8 @@ def parse_line(line: str) -> OutputLine:
 
         if outfile is not None and kind is not None:
             return ProgressLine(outfile.strip(), int(current), int(total), kind)
-        # print(f"ignoring progess line: {line}")
+        else:
+            logger.debug(f"ignoring progess line: {line}")
 
     # extract components from compiler error/warning messages
     pattern = r"^(.+?):(\d+):(\d+):\s+(fatal error|error|warning|note):\s+(.+)$"
@@ -466,7 +478,7 @@ async def process_line(state: ParserState, line: OutputLine) -> ParserState:
             return None
 
 
-async def read_stream(stream, stream_name):
+async def process_stream(stream):
     state = None
 
     try:
@@ -479,34 +491,28 @@ async def read_stream(stream, stream_name):
 
             text: str = line.decode("utf-8").rstrip("\n\r")
 
-            # print(f"[{stream_name}] {text}")
-            # sys.stdout.flush()
-
             state = await process_line(state, parse_line(text))
 
-    except Exception as e:
-        print(f"Error reading {stream_name}: {e}", file=sys.stderr)
+    except Exception:
+        logger.exception("error reading stream")
 
 
-async def run_subprocess(command):
-    # console.print(f"running ninja: {' '.join(command)}")
-
+async def run_subprocess(command) -> None:
     try:
         process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-        pid: int = process.pid
-        await asyncio.gather(read_stream(process.stdout, "STDOUT"), monitor_process_tree(pid))
+        await asyncio.gather(process_stream(process.stdout), monitor_process_tree(process.pid))
         exit_code = await process.wait()
         await Q.put(NinjaExited(exit_code))
 
-    except Exception as e:
-        print(f"Error running subprocess: {e}", file=sys.stderr)
+    except Exception:
+        logger.exception("error running subprocess")
 
 
 def keep_task_after_finish(task: NinjaTask) -> bool:
-    return task.kind != ProgressKind.BUILDING and pathlib.PurePath(task.out_path).is_relative_to(S.root_dir)
+    return task.kind != ProgressKind.BUILDING and PurePath(task.out_path).is_relative_to(S.root_dir)
 
 
-async def render():
+async def render_loop() -> None:
     columns = [TextColumn("[progress.description]{task.description}"), BarColumn(bar_width=10), TaskProgressColumn(), TimeElapsedColumn()]
     task_ids: dict[str, TaskID] = {}
     with Progress(*columns, console=console) as progress:
@@ -592,8 +598,48 @@ async def render():
     raise NinjaStoppedException(S.stopped_reason)
 
 
-async def main_async():
+async def main_async(ninja_args) -> None:
+    try:
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(run_subprocess(["ninja", "-v", *ninja_args]))
+            tg.create_task(handle_messages())
+            tg.create_task(render_loop())
+    except* NinjaStoppedException:
+        pass
+    except* Exception:
+        logger.exception("exception in task group")
+
+
+def shortcircuit(ninja_args: list[str]) -> bool:
+    for arg in ninja_args:
+        if arg.strip() == "--version":  # print ninja version and exit
+            return True
+        if arg.startswith("cmTC_"):  # CMake try-compile targets
+            return True
+        if "/CMakeFiles/CMakeTmp" in arg:  # CMake try-compile stuff
+            return True
+        if "/CMakeFiles/CMakeScratch" in arg:  # CMake try-compile stuff
+            return True
+    return False
+
+
+def main():
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+
+    logging.basicConfig(
+        level=logging.INFO,  #
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        handlers=[logging.FileHandler(APP_DIR / "ninja-so-fancy.log")],
+    )
+
     ninja_args = sys.argv[1:]
+
+    logger.info(f"started with args: {ninja_args}")
+
+    if shortcircuit(ninja_args):
+        logger.info("short circuiting...")
+        proc = subprocess.run(["ninja", *ninja_args])
+        return proc.returncode
 
     parser = argparse.ArgumentParser()
 
@@ -609,19 +655,17 @@ async def main_async():
         metavar="FILE",
     )
 
-    parser.add_argument("--version", action="store_true")
-
     args, _ = parser.parse_known_args()
 
     try:
         ninja_proc = subprocess.run(["ninja", "--version"], capture_output=True)
         ninja_version = ninja_proc.stdout.decode("utf-8").strip()
     except FileNotFoundError:
-        print("error: ninja executable not found")
+        print("error: ninja executable not found", file=sys.stderr)
         return 1
     except Exception as ex:
-        print("failed to invoke `ninja --version`; be sure a recent version of ninja is on your PATH!")
-        print(f"error message: {ex}")
+        print("failed to invoke `ninja --version`; be sure a recent version of ninja is on your PATH!", file=sys.stderr)
+        print(f"error message: {ex}", file=sys.stderr)
         return 1
 
     ninja_version_match = re.search(r"(\d+)\.(\d+)\.(\w+)", ninja_version)
@@ -630,17 +674,10 @@ async def main_async():
         minor = int(ninja_version_match.group(2))
         # patch = ninja_version_match.group(3)
         if (major < 1) or (major < 2 and minor < 10):
-            print(f"warning: old version of ninja detected: {ninja_version}")
+            print(f"warning: old version of ninja detected: {ninja_version}", file=sys.stderr)
     else:
-        print("output of `ninja --version` doesn't have expected format.")
+        print("output of `ninja --version` doesn't have expected format.", file=sys.stderr)
         return 1
-
-    # intercept the --version flag so that CMake accepts
-    # this as a ninja executable
-
-    if args.version:
-        print(ninja_version)
-        return 0
 
     S.root_dir = os.getcwd()
 
@@ -650,30 +687,18 @@ async def main_async():
     if args.f is not None:
         S.root_dir = os.path.dirname(os.path.abspath(args.f))
 
-    try:
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(run_subprocess(["ninja", "-v", *ninja_args]))
-            tg.create_task(handle_messages())
-            tg.create_task(render())
-    except* NinjaStoppedException:
-        pass
-    except* Exception as e:
-        print(f"exception in task group: {e.exceptions}")
-    finally:
-        if S.stopped_reason:
-            if S.stopped_error:
-                console.print(f"🥷 [red]failed ({S.stopped_reason}).")
-            else:
-                console.print(f"🥷 [green]finished ({S.stopped_reason}).")
+    asyncio.run(main_async(ninja_args))
+
+    if S.stopped_reason:
+        if S.stopped_error:
+            console.print(f"🥷 [red]failed ({S.stopped_reason}).")
         else:
-            if S.stopped_error:
-                console.print("🥷 [red]failed.")
-            else:
-                console.print("🥷 [green]finished.")
-
-
-def main():
-    asyncio.run(main_async())
+            console.print(f"🥷 [green]finished ({S.stopped_reason}).")
+    else:
+        if S.stopped_error:
+            console.print("🥷 [red]failed.")
+        else:
+            console.print("🥷 [green]finished.")
 
 
 if __name__ == "__main__":
