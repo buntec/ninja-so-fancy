@@ -4,6 +4,8 @@
 It enhances and enriches ninja's output to make it more useful and pleasant to human users.
 If you spend a lot of time staring at build outputs, you may find this useful.
 
+<img alt="Demo" src="demo.gif" width="600" />
+
 Disclaimer: this is work-in-progress - expect bugs!
 
 ## Install
