@@ -1,8 +1,9 @@
-# ninja-so-fancy
+# 🥷 ninja-so-fancy 💅
 
 `ninja-so-fancy` is a drop-in replacement for and wrapper around the `ninja` build tool.
 It enhances and enriches ninja's output to make it more useful and pleasant to human users.
 If you spend a lot of time staring at build outputs, you may find this useful.
+The name is inspired by the lovely [diff-so-fancy](https://github.com/so-fancy/diff-so-fancy).
 
 <img alt="Demo" src="demo.gif" width="600" />
 
@@ -26,5 +27,5 @@ uv tool upgrade ninja-so-fancy
 ## Use with CMake
 
 ```sh
-cmake -G Ninja -B build -DCMAKE_MAKE_PROGRAM=ninja-so-fancy
+cmake -B build -G Ninja -DCMAKE_MAKE_PROGRAM=ninja-so-fancy
 ```
