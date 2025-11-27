@@ -563,7 +563,7 @@ def keep_task_after_finish(task: NinjaTask) -> bool:
     return task.kind != TaskKind.COMPILING and PurePath(task.out_path).is_relative_to(S.root_dir)
 
 
-class MillisElapsedColumn(ProgressColumn):
+class SecondsElapsedColumn(ProgressColumn):
     def render(self, task: Task) -> Text:
         elapsed = task.finished_time if task.finished else task.elapsed
         if elapsed is None:
@@ -578,7 +578,7 @@ async def render_loop() -> None:
         BarColumn(bar_width=10),
         TaskProgressColumn(),
         # TimeElapsedColumn(),
-        MillisElapsedColumn(),
+        SecondsElapsedColumn(),
     ]
     task_ids: dict[str, TaskID] = {}
     with Progress(*columns, console=console) as progress:
@@ -762,18 +762,22 @@ def main():
     if args.f is not None:
         S.root_dir = os.path.dirname(os.path.abspath(args.f))
 
+    t_start = time.time()
+
     asyncio.run(main_async(ninja_args))
+
+    t_elapsed = time.time() - t_start
 
     if S.stopped_reason:
         if S.stopped_error:
-            console.print(f"🥷 [red]failed ({S.stopped_reason}).")
+            console.print(f"🥷 [red]failed ({S.stopped_reason})")
         else:
-            console.print(f"🥷 [green]finished ({S.stopped_reason}).")
+            console.print(f"🥷 [green]finished ({S.stopped_reason})")
     else:
         if S.stopped_error:
-            console.print("🥷 [red]failed.")
+            console.print("🥷 [red]failed")
         else:
-            console.print("🥷 [green]finished.")
+            console.print(f"🥷 [green]finished in {t_elapsed:.1f}s")
 
 
 if __name__ == "__main__":
