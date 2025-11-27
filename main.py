@@ -23,24 +23,37 @@ from pathlib import Path, PurePath
 import psutil
 import watchfiles
 from rich.console import Console
-from rich.progress import BarColumn, Progress, TaskID, TaskProgressColumn, TextColumn, TimeElapsedColumn
+from rich.progress import BarColumn, Progress, ProgressColumn, Task, TaskID, TaskProgressColumn, Text, TextColumn
 from watchfiles import awatch
+
+LOG_LEVELS = {
+    "FATAL": logging.FATAL,
+    "ERROR": logging.ERROR,
+    "WARNING": logging.WARNING,
+    "WARN": logging.WARNING,
+    "INFO": logging.INFO,
+    "DEBUG": logging.DEBUG,
+}
 
 logger = logging.getLogger(__name__)
 
+# logs will be stored here
 APP_DIR = Path.home() / ".local" / "share" / "ninja-so-fancy"
 
 # not really needed and may cause "too many open files" errors
 WATCH_DIRS = False
 
 # in seconds
-PROCESS_TREE_CHECK_INTERVAL = float(os.environ.get("NINJASOFANCY_PROCESS_TREE_CHECK_INTERVAL", "0.25"))
+PROCESS_TREE_CHECK_INTERVAL = float(os.environ.get("NINJASOFANCY_PROCESS_TREE_CHECK_INTERVAL", "0.1"))
 
 # certain paths will be shortened to this length for display purposes
-MAX_PATH_LENGTH = int(os.environ.get("NINJASOFANCY_MAX_PATH_LENGTH", "50"))
+MAX_PATH_LENGTH = int(os.environ.get("NINJASOFANCY_MAX_PATH_LENGTH", "40"))
 
 # certain lines will be shortened to this length to reduce clutter
 MAX_LINE_LENGTH = int(os.environ.get("NINJASOFANCY_MAX_LINE_LENGTH", "320"))
+
+# see LOG_LEVELS for acceptable values
+LOG_LEVEL = os.getenv("NINJASOFANCY_LOG_LEVEL", "INFO").upper()
 
 
 class Severity(IntEnum):
@@ -50,8 +63,8 @@ class Severity(IntEnum):
     FATAL_ERROR = 4
 
 
-class ProgressKind(StrEnum):
-    BUILDING = "building"
+class TaskKind(StrEnum):
+    COMPILING = "building"
     LINKING_EXE = "linking executable"
     LINKING_SHARED_LIB = "linking shared library"
     LINKING_STATIC_LIB = "linking static library"
@@ -76,7 +89,7 @@ class ProgressLine:
     out_path: str
     count_current: int
     count_total: int
-    kind: ProgressKind
+    kind: TaskKind
 
 
 @dataclass
@@ -128,7 +141,18 @@ class BuildingObject:
     out_path: str
     count_current: int | None
     count_total: int | None
-    kind: ProgressKind
+    kind: TaskKind
+
+
+@dataclass
+class NewChildProcess:
+    info: ProcInfo
+
+
+@dataclass
+class FinishedChildProcess:
+    pid: int
+    time: float
 
 
 @dataclass
@@ -169,7 +193,9 @@ class ErrorMessage:
     lines: list[str]
 
 
-type Message = CompilerDiagnostic | ErrorMessage | BuildingObject | FinishedObject | FileChange | NinjaStopped | NinjaExited
+type Message = (
+    CompilerDiagnostic | ErrorMessage | BuildingObject | FinishedObject | FileChange | NinjaStopped | NinjaExited | NewChildProcess | FinishedChildProcess
+)
 
 
 @dataclass
@@ -177,13 +203,15 @@ class NinjaTask:
     out_path: str
     start_time: float
     end_time: float | None
-    kind: ProgressKind
+    kind: TaskKind
+    proc: ProcInfo | None
 
 
 @dataclass
 class AppState:
     root_dir: str
     tasks: dict[str, NinjaTask]
+    child_procs: dict[int, ProcInfo]  # key=pid
     diagnostics: list[CompilerDiagnostic]
     error_messages: list[ErrorMessage]
     watched_dirs: set[str]
@@ -196,7 +224,7 @@ class AppState:
 
 Q: Queue[Message] = Queue(100)
 
-S = AppState(".", {}, [], [], set(), None, None, False, None, False)
+S = AppState(".", {}, {}, [], [], set(), None, None, False, None, False)
 
 ev_state_changed = Event()
 
@@ -259,17 +287,28 @@ def outfile_from_cmd(cmd: str) -> str | None:
         return match.group(1)
 
 
-def progress_kind_from_cmd(cmd: str) -> ProgressKind | None:
+def task_kind_from_outfile(outfile: str) -> TaskKind:
+    if outfile.endswith(".o"):
+        return TaskKind.COMPILING
+    elif outfile.endswith(".so") or outfile.endswith(".dylib"):
+        return TaskKind.LINKING_SHARED_LIB
+    elif outfile.endswith(".a"):
+        return TaskKind.LINKING_STATIC_LIB
+    else:
+        return TaskKind.LINKING_EXE
+
+
+def task_kind_from_cmd(cmd: str) -> TaskKind | None:
     out_path = outfile_from_cmd(cmd)
     if out_path is not None:
         if out_path.endswith(".o"):
-            return ProgressKind.BUILDING
+            return TaskKind.COMPILING
         elif out_path.endswith(".so") or out_path.endswith(".dylib"):
-            return ProgressKind.LINKING_SHARED_LIB
+            return TaskKind.LINKING_SHARED_LIB
         elif out_path.endswith(".a"):
-            return ProgressKind.LINKING_STATIC_LIB
+            return TaskKind.LINKING_STATIC_LIB
         else:
-            return ProgressKind.LINKING_EXE
+            return TaskKind.LINKING_EXE
 
 
 async def monitor_process_tree(parent_pid: int) -> None:
@@ -289,13 +328,9 @@ async def monitor_process_tree(parent_pid: int) -> None:
             if child.pid not in seen_pids:
                 info = extract_process_info(child)
                 if info is not None:
+                    logger.debug(f"new child process detected: {info}")
                     seen_pids[child.pid] = info
-                    out_path = outfile_from_cmd(info.cmd)
-                    kind = progress_kind_from_cmd(info.cmd)
-                    if (out_path is not None) and (not out_path.endswith(".ii")) and (kind is not None):
-                        await Q.put(BuildingObject(info.create_time, out_path, None, None, kind))
-                    else:
-                        logger.debug(f"ignoring child process: {info}")
+                    await Q.put(NewChildProcess(info))
                 else:
                     seen_pids[child.pid] = None
 
@@ -304,13 +339,11 @@ async def monitor_process_tree(parent_pid: int) -> None:
                 try:
                     child = psutil.Process(pid)
                     if not child.is_running():
-                        out_path = outfile_from_cmd(info.cmd)
-                        if out_path is not None:
-                            await Q.put(FinishedObject(out_path, time.time()))
+                        logger.debug(f"child process finished: {pid}")
+                        await Q.put(FinishedChildProcess(pid, time.time()))
                 except psutil.NoSuchProcess:
-                    out_path = outfile_from_cmd(info.cmd)
-                    if out_path is not None:
-                        await Q.put(FinishedObject(out_path, time.time()))
+                    logger.debug(f"child process finished: {pid}")
+                    await Q.put(FinishedChildProcess(pid, time.time()))
 
         await asyncio.sleep(PROCESS_TREE_CHECK_INTERVAL)
 
@@ -328,6 +361,24 @@ async def handle_messages() -> None:
     while True:
         msg = await Q.get()
         match msg:
+            case NewChildProcess(info):
+                out_path = outfile_from_cmd(info.cmd)
+                if out_path is not None:
+                    if not os.path.isabs(out_path):
+                        out_path = os.path.join(S.root_dir, out_path)
+                    kind = task_kind_from_outfile(out_path)
+                    S.tasks[out_path] = NinjaTask(out_path, info.create_time, None, kind, info)
+                    S.child_procs[info.pid] = info
+            case FinishedChildProcess(pid, end_time):
+                if pid in S.child_procs:
+                    proc = S.child_procs[pid]
+                    out_path = outfile_from_cmd(proc.cmd)
+                    if out_path is not None:
+                        if not os.path.isabs(out_path):
+                            out_path = os.path.join(S.root_dir, out_path)
+                        task = S.tasks[out_path]
+                        if task.proc is not None and task.proc.pid == pid:
+                            S.tasks[out_path].end_time = end_time
             case BuildingObject(start_time, out_path, count_current, count_total, kind):
                 if not os.path.isabs(out_path):
                     out_path = os.path.join(S.root_dir, out_path)
@@ -340,9 +391,9 @@ async def handle_messages() -> None:
                 if os.path.exists(out_path):
                     m_time = os.path.getmtime(out_path)
                 if m_time is not None and m_time > start_time - 3:
-                    S.tasks[out_path] = NinjaTask(out_path, start_time, max(m_time, start_time), kind)
+                    S.tasks[out_path] = NinjaTask(out_path, start_time, max(m_time, start_time), kind, None)
                 else:
-                    S.tasks[out_path] = NinjaTask(out_path, start_time, None, kind)
+                    S.tasks[out_path] = NinjaTask(out_path, start_time, None, kind, None)
                 if count_current is not None:
                     S.count_current = count_current
                 if count_total is not None:
@@ -398,7 +449,7 @@ def parse_line(line: str) -> OutputLine:
         reason = match.group(1).strip()
         return NinjaStoppedLine(reason, True)
 
-    # extract progress and filepath from Ninja build output
+    # extract progress and file path from Ninja build output
     pattern = r"\[(\d+)/(\d+)\]\s+(.+)$"
     match = re.search(pattern, line)
     if match:
@@ -406,7 +457,7 @@ def parse_line(line: str) -> OutputLine:
         total = match.group(2)
         cmd = match.group(3).strip()
         outfile = outfile_from_cmd(cmd)
-        kind = progress_kind_from_cmd(cmd)
+        kind = task_kind_from_cmd(cmd)
 
         if outfile is not None and kind is not None:
             return ProgressLine(outfile.strip(), int(current), int(total), kind)
@@ -497,7 +548,7 @@ async def process_stream(stream):
         logger.exception("error reading stream")
 
 
-async def run_subprocess(command) -> None:
+async def run_subprocess(command: list[str]) -> None:
     try:
         process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         await asyncio.gather(process_stream(process.stdout), monitor_process_tree(process.pid))
@@ -509,11 +560,26 @@ async def run_subprocess(command) -> None:
 
 
 def keep_task_after_finish(task: NinjaTask) -> bool:
-    return task.kind != ProgressKind.BUILDING and PurePath(task.out_path).is_relative_to(S.root_dir)
+    return task.kind != TaskKind.COMPILING and PurePath(task.out_path).is_relative_to(S.root_dir)
+
+
+class MillisElapsedColumn(ProgressColumn):
+    def render(self, task: Task) -> Text:
+        elapsed = task.finished_time if task.finished else task.elapsed
+        if elapsed is None:
+            return Text("-", style="progress.elapsed")
+        return Text(f"{elapsed:6.1f}s", style="progress.elapsed")
 
 
 async def render_loop() -> None:
-    columns = [TextColumn("[progress.description]{task.description}"), BarColumn(bar_width=10), TaskProgressColumn(), TimeElapsedColumn()]
+    columns = [
+        TextColumn("[progress.description]{task.description}"),
+        TextColumn("{task.fields[proc_name]}", justify="left"),
+        BarColumn(bar_width=10),
+        TaskProgressColumn(),
+        # TimeElapsedColumn(),
+        MillisElapsedColumn(),
+    ]
     task_ids: dict[str, TaskID] = {}
     with Progress(*columns, console=console) as progress:
         diags_seen: set[CompilerDiagnostic] = set()
@@ -521,7 +587,7 @@ async def render_loop() -> None:
 
         max_severity_seen = Severity.NOTE
 
-        id0 = progress.add_task("🥷", total=None)
+        id0 = progress.add_task("🥷", total=None, proc_name="")
 
         while True:
             await ev_state_changed.wait()
@@ -561,31 +627,38 @@ async def render_loop() -> None:
             progress.update(id0, total=S.count_total, completed=S.count_current)
 
             for out_path, task in S.tasks.items():
+                if not PurePath(out_path).is_relative_to(S.root_dir):  # don't render progress on temporary files
+                    continue
+
+                extras: dict = {"proc_name": f"({shorten_string(task.proc.name, 10)})" if task.proc is not None else ""}
+
                 if out_path not in task_ids:
                     match task.kind:
-                        case ProgressKind.BUILDING:
-                            task_ids[out_path] = progress.add_task(f"🛠️ {shorten_path(os.path.relpath(out_path, S.root_dir))}", total=None)
-                        case ProgressKind.LINKING_EXE:
-                            task_ids[out_path] = progress.add_task(f"⚡️ {shorten_path(os.path.relpath(out_path, S.root_dir))}", total=None)
-                        case ProgressKind.LINKING_SHARED_LIB:
-                            task_ids[out_path] = progress.add_task(f"📚 {shorten_path(os.path.relpath(out_path, S.root_dir))}", total=None)
-                        case ProgressKind.LINKING_STATIC_LIB:
-                            task_ids[out_path] = progress.add_task(f"📚 {shorten_path(os.path.relpath(out_path, S.root_dir))}", total=None)
+                        case TaskKind.COMPILING:
+                            task_ids[out_path] = progress.add_task(f"🛠️ {shorten_path(os.path.relpath(out_path, S.root_dir))}", total=None, **extras)
+                        case TaskKind.LINKING_EXE:
+                            task_ids[out_path] = progress.add_task(f"⚡️ {shorten_path(os.path.relpath(out_path, S.root_dir))}", total=None, **extras)
+                        case TaskKind.LINKING_SHARED_LIB:
+                            task_ids[out_path] = progress.add_task(f"📚 {shorten_path(os.path.relpath(out_path, S.root_dir))}", total=None, **extras)
+                        case TaskKind.LINKING_STATIC_LIB:
+                            task_ids[out_path] = progress.add_task(f"📚 {shorten_path(os.path.relpath(out_path, S.root_dir))}", total=None, **extras)
 
                 tid = task_ids[out_path]
 
                 if tid in progress.task_ids:
                     if task.end_time is not None:
-                        progress.update(tid, total=100, completed=100, refresh=True)
+                        progress.update(tid, total=100, completed=100, proc_name="", refresh=True)
                         if not keep_task_after_finish(task):
                             progress.remove_task(tid)
+                    else:
+                        progress.update(tid, **extras)
 
             if S.stopped:
                 if not S.stopped_error:
                     for out_path, task in S.tasks.items():
                         tid = task_ids[out_path]
                         if tid in progress.task_ids:
-                            progress.update(tid, total=100, completed=100, refresh=True)
+                            progress.update(tid, total=100, completed=100, proc_name="", refresh=True)
                             if not keep_task_after_finish(task):
                                 progress.remove_task(tid)
                 progress.remove_task(id0)
@@ -626,8 +699,10 @@ def shortcircuit(ninja_args: list[str]) -> bool:
 def main():
     APP_DIR.mkdir(parents=True, exist_ok=True)
 
+    log_level = LOG_LEVELS.get(LOG_LEVEL, logging.INFO)
+
     logging.basicConfig(
-        level=logging.INFO,  #
+        level=log_level,
         format="%(asctime)s | %(levelname)s | %(message)s",
         handlers=[logging.FileHandler(APP_DIR / "ninja-so-fancy.log")],
     )
