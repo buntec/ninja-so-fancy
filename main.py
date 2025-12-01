@@ -661,6 +661,7 @@ async def render_loop() -> None:
                             progress.update(tid, total=100, completed=100, proc_name="", refresh=True)
                             if not keep_task_after_finish(task):
                                 progress.remove_task(tid)
+                    progress.update(id0, completed=S.count_total, proc_name="", refresh=True)
                 progress.remove_task(id0)
                 break
 
