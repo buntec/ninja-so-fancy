@@ -369,6 +369,7 @@ async def handle_messages() -> None:
                     kind = task_kind_from_outfile(out_path)
                     S.tasks[out_path] = NinjaTask(out_path, info.create_time, None, kind, info)
                     S.child_procs[info.pid] = info
+                    ev_state_changed.set()
             case FinishedChildProcess(pid, end_time):
                 if pid in S.child_procs:
                     proc = S.child_procs[pid]
@@ -379,6 +380,7 @@ async def handle_messages() -> None:
                         task = S.tasks[out_path]
                         if task.proc is not None and task.proc.pid == pid:
                             S.tasks[out_path].end_time = end_time
+                            ev_state_changed.set()
             case BuildingObject(start_time, out_path, count_current, count_total, kind):
                 if not os.path.isabs(out_path):
                     out_path = os.path.join(S.root_dir, out_path)
@@ -574,7 +576,7 @@ class SecondsElapsedColumn(ProgressColumn):
 async def render_loop() -> None:
     columns = [
         TextColumn("[progress.description]{task.description}"),
-        TextColumn("{task.fields[proc_name]}", justify="left"),
+        TextColumn("{task.fields[proc_name]}", justify="left", style="cyan"),
         BarColumn(bar_width=10),
         TaskProgressColumn(),
         # TimeElapsedColumn(),
