@@ -2,7 +2,7 @@
 #
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["rich", "watchfiles", "psutil"]
+# dependencies = ["rich", "psutil"]
 # ///
 
 
@@ -10,7 +10,6 @@ import argparse
 import asyncio
 import logging
 import os
-import pathlib
 import re
 import subprocess
 import sys
@@ -21,10 +20,8 @@ from enum import IntEnum, StrEnum
 from pathlib import Path, PurePath
 
 import psutil
-import watchfiles
 from rich.console import Console
 from rich.progress import BarColumn, Progress, ProgressColumn, Task, TaskID, TaskProgressColumn, Text, TextColumn
-from watchfiles import awatch
 
 LOG_LEVELS = {
     "FATAL": logging.FATAL,
@@ -40,8 +37,6 @@ logger = logging.getLogger(__name__)
 # logs will be stored here
 APP_DIR = Path.home() / ".local" / "share" / "ninja-so-fancy"
 
-# not really needed and may cause "too many open files" errors
-WATCH_DIRS = False
 
 # in seconds
 PROCESS_TREE_CHECK_INTERVAL = float(os.environ.get("NINJASOFANCY_PROCESS_TREE_CHECK_INTERVAL", "0.1"))
@@ -68,11 +63,6 @@ class TaskKind(StrEnum):
     LINKING_EXE = "linking executable"
     LINKING_SHARED_LIB = "linking shared library"
     LINKING_STATIC_LIB = "linking static library"
-
-
-class NinjaStoppedException(Exception):
-    def __init__(self, reason: str | int | None):
-        self.reason = reason
 
 
 @dataclass
@@ -136,8 +126,8 @@ type ParserState = ParsingCompilerMessage | ParsingFailureMessage | None
 
 
 @dataclass
-class BuildingObject:
-    start_time: float
+class FinishedNinjaTask:
+    time: float
     out_path: str
     count_current: int | None
     count_total: int | None
@@ -194,7 +184,7 @@ class ErrorMessage:
 
 
 type Message = (
-    CompilerDiagnostic | ErrorMessage | BuildingObject | FinishedObject | FileChange | NinjaStopped | NinjaExited | NewChildProcess | FinishedChildProcess
+    CompilerDiagnostic | ErrorMessage | FinishedNinjaTask | FinishedObject | FileChange | NinjaStopped | NinjaExited | NewChildProcess | FinishedChildProcess
 )
 
 
@@ -348,15 +338,6 @@ async def monitor_process_tree(parent_pid: int) -> None:
         await asyncio.sleep(PROCESS_TREE_CHECK_INTERVAL)
 
 
-async def watch_dir(path: str) -> None:
-    pathlib.Path(path).mkdir(parents=True, exist_ok=True)
-    async for changes in awatch(path, recursive=False):
-        for change in changes:
-            change_type, change_path = change
-            if change_type == watchfiles.Change.added or change_type == watchfiles.Change.modified:
-                await Q.put(FileChange(change_path, time.time()))
-
-
 async def handle_messages() -> None:
     while True:
         msg = await Q.get()
@@ -381,21 +362,10 @@ async def handle_messages() -> None:
                         if task.proc is not None and task.proc.pid == pid:
                             S.tasks[out_path].end_time = end_time
                             ev_state_changed.set()
-            case BuildingObject(start_time, out_path, count_current, count_total, kind):
+            case FinishedNinjaTask(time_, out_path, count_current, count_total, kind):
                 if not os.path.isabs(out_path):
                     out_path = os.path.join(S.root_dir, out_path)
-                if WATCH_DIRS:
-                    dir = os.path.dirname(out_path)
-                    if dir not in S.watched_dirs:
-                        asyncio.create_task(watch_dir(dir))
-                        S.watched_dirs.add(dir)
-                m_time = None
-                if os.path.exists(out_path):
-                    m_time = os.path.getmtime(out_path)
-                if m_time is not None and m_time > start_time - 3:
-                    S.tasks[out_path] = NinjaTask(out_path, start_time, max(m_time, start_time), kind, None)
-                else:
-                    S.tasks[out_path] = NinjaTask(out_path, start_time, None, kind, None)
+                S.tasks[out_path] = NinjaTask(out_path, time_, time_, kind, None)
                 if count_current is not None:
                     S.count_current = count_current
                 if count_total is not None:
@@ -428,11 +398,13 @@ async def handle_messages() -> None:
                 S.stopped_reason = reason
                 S.stopped_error = is_error
                 ev_state_changed.set()
+                break
             case NinjaExited(exit_code):
                 S.stopped = True
                 S.stopped_reason = exit_code
                 S.stopped_error = exit_code != 0
                 ev_state_changed.set()
+                break
 
 
 def parse_line(line: str) -> OutputLine:
@@ -519,7 +491,7 @@ async def process_line(state: ParserState, line: OutputLine) -> ParserState:
                     await Q.put(ErrorMessage(out_path, lines))
             if not os.path.isabs(out_path):
                 out_path = os.path.join(S.root_dir, out_path)
-            await Q.put(BuildingObject(time.time(), out_path, count_current, count_total, kind))
+            await Q.put(FinishedNinjaTask(time.time(), out_path, count_current, count_total, kind))
             return None
         case NinjaStoppedLine(reason, is_error):
             match state:
@@ -663,15 +635,17 @@ async def render_loop() -> None:
                             progress.update(tid, total=100, completed=100, proc_name="", refresh=True)
                             if not keep_task_after_finish(task):
                                 progress.remove_task(tid)
-                    progress.update(id0, completed=S.count_total, proc_name="", refresh=True)
+                    progress.update(id0, completed=S.count_total, refresh=True)
+                    # try force rendering the switch to green
+                    progress.update(id0, total=100, completed=100, proc_name="", refresh=True)
                 progress.remove_task(id0)
+                progress.refresh()
                 break
 
             ev_state_changed.clear()
 
     if len(task_ids) > 0:
         console.line()
-    raise NinjaStoppedException(S.stopped_reason)
 
 
 async def main_async(ninja_args) -> None:
@@ -680,8 +654,6 @@ async def main_async(ninja_args) -> None:
             tg.create_task(run_subprocess(["ninja", "-v", *ninja_args]))
             tg.create_task(handle_messages())
             tg.create_task(render_loop())
-    except* NinjaStoppedException:
-        pass
     except* Exception:
         logger.exception("exception in task group")
 
