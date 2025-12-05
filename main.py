@@ -23,6 +23,8 @@ import psutil
 from rich.console import Console
 from rich.progress import BarColumn, Progress, ProgressColumn, Task, TaskID, TaskProgressColumn, Text, TextColumn
 
+from _version import __version__
+
 LOG_LEVELS = {
     "FATAL": logging.FATAL,
     "ERROR": logging.ERROR,
@@ -705,7 +707,17 @@ def main():
         metavar="FILE",
     )
 
+    parser.add_argument(
+        "--nsf-version",
+        action="store_true",
+        help="print ninja-so-fancy version and exit",
+    )
+
     args, _ = parser.parse_known_args()
+
+    if args.nsf_version:
+        print(__version__)
+        return 0
 
     try:
         ninja_proc = subprocess.run(["ninja", "--version"], capture_output=True)
