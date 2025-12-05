@@ -623,6 +623,8 @@ async def render_loop() -> None:
                         progress.update(tid, **extras)
 
             if not keep_going:
+                progress.remove_task(id0)
+                progress.refresh()
                 break
 
             if S.stopped:
@@ -633,9 +635,10 @@ async def render_loop() -> None:
                             progress.update(tid, total=100, completed=100, proc_name="", refresh=True)
                             if not keep_task_after_finish(task):
                                 progress.remove_task(tid)
-                    progress.update(id0, completed=S.count_total, refresh=True)
-                progress.remove_task(id0)
-                progress.refresh()
+                    if S.count_total is not None and S.count_total > 0:
+                        progress.update(id0, completed=S.count_total, refresh=True)
+                    else:
+                        progress.update(id0, total=100, completed=100, refresh=True)
                 keep_going = False
                 await Q.put(Finish())
 
