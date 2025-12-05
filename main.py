@@ -152,9 +152,8 @@ class FinishedObject:
 
 
 @dataclass
-class FileChange:
-    path: str
-    time: float
+class Finish:
+    pass
 
 
 @dataclass
@@ -184,7 +183,7 @@ class ErrorMessage:
 
 
 type Message = (
-    CompilerDiagnostic | ErrorMessage | FinishedNinjaTask | FinishedObject | FileChange | NinjaStopped | NinjaExited | NewChildProcess | FinishedChildProcess
+    CompilerDiagnostic | ErrorMessage | FinishedNinjaTask | FinishedObject | NinjaStopped | NinjaExited | NewChildProcess | FinishedChildProcess | Finish
 )
 
 
@@ -371,14 +370,6 @@ async def handle_messages() -> None:
                 if count_total is not None:
                     S.count_total = count_total
                 ev_state_changed.set()
-            case FileChange(file_path, time):
-                if not os.path.isabs(file_path):
-                    file_path = os.path.join(S.root_dir, file_path)
-                if file_path in S.tasks:
-                    task = S.tasks[file_path]
-                    if (task.end_time is None) and (time > task.start_time - 3):
-                        task.end_time = max(task.start_time, time)
-                        ev_state_changed.set()
             case CompilerDiagnostic() as cd:
                 S.diagnostics.append(cd)
                 ev_state_changed.set()
@@ -398,11 +389,13 @@ async def handle_messages() -> None:
                 S.stopped_reason = reason
                 S.stopped_error = is_error
                 ev_state_changed.set()
-                break
             case NinjaExited(exit_code):
                 S.stopped = True
                 S.stopped_reason = exit_code
                 S.stopped_error = exit_code != 0
+                ev_state_changed.set()
+            case Finish():
+                await asyncio.sleep(0.1)
                 ev_state_changed.set()
                 break
 
@@ -563,6 +556,8 @@ async def render_loop() -> None:
 
         id0 = progress.add_task("🥷", total=None, proc_name="")
 
+        keep_going = True
+
         while True:
             await ev_state_changed.wait()
 
@@ -627,6 +622,9 @@ async def render_loop() -> None:
                     else:
                         progress.update(tid, **extras)
 
+            if not keep_going:
+                break
+
             if S.stopped:
                 if not S.stopped_error:
                     for out_path, task in S.tasks.items():
@@ -636,11 +634,10 @@ async def render_loop() -> None:
                             if not keep_task_after_finish(task):
                                 progress.remove_task(tid)
                     progress.update(id0, completed=S.count_total, refresh=True)
-                    # try force rendering the switch to green
-                    progress.update(id0, total=100, completed=100, proc_name="", refresh=True)
                 progress.remove_task(id0)
                 progress.refresh()
-                break
+                keep_going = False
+                await Q.put(Finish())
 
             ev_state_changed.clear()
 
