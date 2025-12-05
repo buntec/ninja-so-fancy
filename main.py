@@ -630,8 +630,8 @@ async def render_loop() -> None:
             if S.stopped:
                 if not S.stopped_error:
                     for out_path, task in S.tasks.items():
-                        tid = task_ids[out_path]
-                        if tid in progress.task_ids:
+                        tid = task_ids.get(out_path)
+                        if tid is not None and tid in progress.task_ids:
                             progress.update(tid, total=100, completed=100, proc_name="", refresh=True)
                             if not keep_task_after_finish(task):
                                 progress.remove_task(tid)
