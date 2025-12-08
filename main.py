@@ -267,7 +267,7 @@ def get_process_tree(parent_pid: int) -> list[psutil.Process]:
 def extract_process_info(proc: psutil.Process) -> ProcInfo | None:
     try:
         return ProcInfo(proc.pid, proc.name(), " ".join(proc.cmdline()), proc.status(), proc.create_time())
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
         return None
 
 
