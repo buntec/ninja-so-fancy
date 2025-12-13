@@ -762,8 +762,8 @@ packages:
   timestamp: 1752218330593
 - pypi: ./
   name: ninja-so-fancy
-  version: 0.1.0
-  sha256: 730f33b5625a9719e186ceaac3e7c113c4e445d6948410abdaa9b6fe82bff9a2
+  version: 0.1.dev20+g844bb047a.d20251213
+  sha256: 356be7b84464dc1e7bae128093ee923f602d5d5f0c4e21d7aec64d3749f7e1f4
   requires_dist:
   - psutil>=7.1.3
   - rich>=14.2.0

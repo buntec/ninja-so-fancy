@@ -39,7 +39,6 @@ logger = logging.getLogger(__name__)
 # logs will be stored here
 APP_DIR = Path.home() / ".local" / "share" / "ninja-so-fancy"
 
-
 # in seconds
 PROCESS_TREE_CHECK_INTERVAL = float(os.environ.get("NINJASOFANCY_PROCESS_TREE_CHECK_INTERVAL", "0.1"))
 
@@ -61,7 +60,7 @@ class Severity(IntEnum):
 
 
 class TaskKind(StrEnum):
-    COMPILING = "building"
+    COMPILING = "compiling"
     LINKING_EXE = "linking executable"
     LINKING_SHARED_LIB = "linking shared library"
     LINKING_STATIC_LIB = "linking static library"
@@ -205,7 +204,6 @@ class AppState:
     child_procs: dict[int, ProcInfo]  # key=pid
     diagnostics: list[CompilerDiagnostic]
     error_messages: list[ErrorMessage]
-    watched_dirs: set[str]
     count_current: int | None
     count_total: int | None
     stopped: bool
@@ -215,7 +213,7 @@ class AppState:
 
 Q: Queue[Message] = Queue(100)
 
-S = AppState(".", {}, {}, [], [], set(), None, None, False, None, False)
+S = AppState(".", {}, {}, [], [], None, None, False, None, False)
 
 ev_state_changed = Event()
 
@@ -292,14 +290,7 @@ def task_kind_from_outfile(outfile: str) -> TaskKind:
 def task_kind_from_cmd(cmd: str) -> TaskKind | None:
     out_path = outfile_from_cmd(cmd)
     if out_path is not None:
-        if out_path.endswith(".o"):
-            return TaskKind.COMPILING
-        elif out_path.endswith(".so") or out_path.endswith(".dylib"):
-            return TaskKind.LINKING_SHARED_LIB
-        elif out_path.endswith(".a"):
-            return TaskKind.LINKING_STATIC_LIB
-        else:
-            return TaskKind.LINKING_EXE
+        return task_kind_from_outfile(out_path)
 
 
 async def monitor_process_tree(parent_pid: int) -> None:
@@ -341,7 +332,7 @@ async def monitor_process_tree(parent_pid: int) -> None:
 
 async def handle_messages() -> None:
     while True:
-        msg = await Q.get()
+        msg: Message = await Q.get()
         match msg:
             case NewChildProcess(info):
                 out_path = outfile_from_cmd(info.cmd)
@@ -498,28 +489,23 @@ async def process_line(state: ParserState, line: OutputLine) -> ParserState:
             return None
 
 
-async def process_stream(stream):
-    state = None
-
+async def process_stream(stream: asyncio.StreamReader) -> None:
+    state: ParserState = None
     try:
         while True:
             line = await stream.readline()
-
-            # Empty line means EOF
-            if not line:
+            if not line:  # EOF
                 break
-
             text: str = line.decode("utf-8").rstrip("\n\r")
-
             state = await process_line(state, parse_line(text))
-
     except Exception:
-        logger.exception("error reading stream")
+        logger.exception("error in stream processing")
 
 
-async def run_subprocess(command: list[str]) -> None:
+async def run_ninja_as_subprocess(ninja_args: list[str]) -> None:
     try:
-        process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        process = await asyncio.create_subprocess_exec("ninja", "-v", *ninja_args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        assert process.stdout is not None
         await asyncio.gather(process_stream(process.stdout), monitor_process_tree(process.pid))
         exit_code = await process.wait()
         await Q.put(NinjaExited(exit_code))
@@ -650,16 +636,6 @@ async def render_loop() -> None:
         console.line()
 
 
-async def main_async(ninja_args) -> None:
-    try:
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(run_subprocess(["ninja", "-v", *ninja_args]))
-            tg.create_task(handle_messages())
-            tg.create_task(render_loop())
-    except* Exception:
-        logger.exception("exception in task group")
-
-
 def shortcircuit(ninja_args: list[str]) -> bool:
     for arg in ninja_args:
         if arg.strip() == "--version":  # print ninja version and exit
@@ -673,6 +649,16 @@ def shortcircuit(ninja_args: list[str]) -> bool:
     return False
 
 
+async def main_async(ninja_args: list[str]) -> None:
+    try:
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(run_ninja_as_subprocess(ninja_args))
+            tg.create_task(handle_messages())
+            tg.create_task(render_loop())
+    except* Exception:
+        logger.exception("exception in main task group")
+
+
 def main():
     APP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -684,7 +670,7 @@ def main():
         handlers=[logging.FileHandler(APP_DIR / "ninja-so-fancy.log")],
     )
 
-    ninja_args = sys.argv[1:]
+    ninja_args: list[str] = sys.argv[1:]
 
     logger.info(f"started with args: {ninja_args}")
 
@@ -741,13 +727,12 @@ def main():
         print("output of `ninja --version` doesn't have expected format.", file=sys.stderr)
         return 1
 
-    S.root_dir = os.getcwd()
-
     if args.C is not None:
         S.root_dir = os.path.abspath(args.C)
-
-    if args.f is not None:
+    elif args.f is not None:
         S.root_dir = os.path.dirname(os.path.abspath(args.f))
+    else:
+        S.root_dir = os.getcwd()
 
     t_start = time.time()
 
