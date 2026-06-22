@@ -699,7 +699,7 @@ async fn render_loop(
             .unwrap()
             .progress_chars("=> ");
 
-    let task_style = ProgressStyle::with_template("  {prefix} {msg} {elapsed:>6}").unwrap();
+    let task_style = ProgressStyle::with_template("  {prefix} {wide_msg} {elapsed:>6}").unwrap();
 
     let overall_pb = mp.add(ProgressBar::new(0));
     overall_pb.set_style(overall_style.clone());
