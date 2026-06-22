@@ -1,4 +1,4 @@
-# 🥷 ninja-so-fancy 💫
+# ninja-so-fancy
 
 `ninja-so-fancy` is a thin wrapper around the `ninja` build tool.
 It enhances and enriches ninja's output to make it more useful and pleasant to human users.
@@ -15,18 +15,20 @@ Tested on macOS and Linux using CMake/Clang/GCC.
 You need:
 
 - [ninja](https://ninja-build.org/)
-- [uv](https://github.com/astral-sh/uv)
+- [Rust toolchain](https://rustup.rs/)
 
 ```sh
-# install
-uv tool install git+http://github.com/buntec/ninja-so-fancy
+# install from source
+cargo install --git https://github.com/buntec/ninja-so-fancy
 
-# update
-uv tool upgrade ninja-so-fancy
+# or build locally
+git clone https://github.com/buntec/ninja-so-fancy
+cd ninja-so-fancy
+cargo install --path .
 
 # use
-ninja-so-fancy --version # shows ninja version
-ninja-so-fancy --nsf-version # shows ninja-so-fancy version
+ninja-so-fancy --version      # shows ninja version
+ninja-so-fancy --nsf-version  # shows ninja-so-fancy version
 ```
 
 ## Use with CMake
@@ -34,3 +36,16 @@ ninja-so-fancy --nsf-version # shows ninja-so-fancy version
 ```sh
 cmake -G Ninja -DCMAKE_MAKE_PROGRAM=ninja-so-fancy ...
 ```
+
+## Configuration
+
+Environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NINJASOFANCY_PROCESS_TREE_CHECK_INTERVAL` | `0.1` | Process tree polling interval in seconds |
+| `NINJASOFANCY_MAX_PATH_LENGTH` | `40` | Max display length for paths |
+| `NINJASOFANCY_MAX_LINE_LENGTH` | `320` | Max display length for error lines |
+| `NINJASOFANCY_LOG_LEVEL` | `info` | Log level (debug, info, warn, error) |
+
+Logs are written to `~/.local/share/ninja-so-fancy/ninja-so-fancy.log`.
