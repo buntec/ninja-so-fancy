@@ -630,13 +630,14 @@ async fn handle_messages(
                 count_total,
                 kind,
             } => {
-                s.tasks.entry(out_path.clone()).or_insert(NinjaTask {
+                let task = s.tasks.entry(out_path.clone()).or_insert(NinjaTask {
                     out_path,
                     start_time: time,
-                    end_time: Some(time),
+                    end_time: None,
                     kind,
                     proc_name: None,
                 });
+                task.end_time = Some(time);
                 if let Some(c) = count_current {
                     s.count_current = Some(c);
                 }
@@ -699,22 +700,32 @@ async fn render_loop(
             .unwrap()
             .progress_chars("=> ");
 
-    let task_style = ProgressStyle::with_template("  {prefix} {wide_msg} {elapsed:>6}").unwrap();
+    let task_style =
+        ProgressStyle::with_template("  {prefix} {spinner:.cyan} {wide_msg}")
+            .unwrap()
+            .tick_strings(&["\u{25cb}", "\u{25d4}", "\u{25d1}", "\u{25d5}", "\u{25cf}"]);
 
     let overall_pb = mp.add(ProgressBar::new(0));
     overall_pb.set_style(overall_style.clone());
     overall_pb.enable_steady_tick(Duration::from_millis(100));
 
     let mut task_bars: HashMap<String, ProgressBar> = HashMap::new();
+    let mut task_start_times: HashMap<String, Instant> = HashMap::new();
+    let mut task_frozen_elapsed: HashMap<String, f64> = HashMap::new();
     let mut diags_seen: HashSet<CompilerDiagnostic> = HashSet::new();
     let mut errors_seen: HashSet<String> = HashSet::new();
     let mut max_severity = Severity::Note;
     let mut finished = false;
+    let mut tick_interval = tokio::time::interval(Duration::from_millis(100));
 
     loop {
-        notify.notified().await;
+        tokio::select! {
+            _ = notify.notified() => {}
+            _ = tick_interval.tick() => {}
+        }
 
         let s = state.lock().await;
+        let term_width = console::Term::stdout().size().1 as usize;
 
         // Print diagnostics
         for diag in &s.diagnostics {
@@ -803,30 +814,58 @@ async fn render_loop(
                 .to_string_lossy()
                 .to_string();
             let short = shorten_path(&rel_path, max_path_length);
-            let prefix = format!("{} {}", kind_emoji(task.kind), short);
+            let proc_name_styled = task
+                .proc_name
+                .as_ref()
+                .map(|n| format!("{}", style(format!("({})", shorten_string(n, 10))).magenta()))
+                .unwrap_or_default();
+            let prefix = format!("{} {} {}", kind_emoji(task.kind), short, proc_name_styled);
 
             if !task_bars.contains_key(out_path) {
                 let pb = mp.insert_after(&overall_pb, ProgressBar::new_spinner());
                 pb.set_style(task_style.clone());
                 pb.set_prefix(prefix.clone());
-                if let Some(ref name) = task.proc_name {
-                    pb.set_message(format!("({})", shorten_string(name, 10)));
-                }
                 pb.enable_steady_tick(Duration::from_millis(100));
+                task_start_times.insert(out_path.clone(), Instant::now());
                 task_bars.insert(out_path.clone(), pb);
             }
 
             if let Some(pb) = task_bars.get(out_path) {
+                pb.set_prefix(prefix.clone());
+
                 if task.end_time.is_some() {
-                    pb.set_message("");
+                    if !task_frozen_elapsed.contains_key(out_path) {
+                        let elapsed = task_start_times
+                            .get(out_path)
+                            .map(|t| t.elapsed().as_secs_f64())
+                            .unwrap_or(0.0);
+                        task_frozen_elapsed.insert(out_path.clone(), elapsed);
+                    }
+                    let elapsed = task_frozen_elapsed[out_path];
+                    let elapsed_str = format!("{:.1}s", elapsed);
+                    let prefix_width = console::measure_text_width(&prefix);
+                    let left_width = 2 + prefix_width + 1 + 1 + 1;
+                    let fill_width = term_width.saturating_sub(left_width + elapsed_str.len());
+                    let msg = format!("{:>width$}", elapsed_str, width = fill_width + elapsed_str.len());
+                    pb.set_message(msg);
+
                     if keep_task_after_finish(task, &root_dir) {
                         pb.finish();
                     } else {
                         pb.finish_and_clear();
                         mp.remove(pb);
                     }
-                } else if let Some(ref name) = task.proc_name {
-                    pb.set_message(format!("({})", shorten_string(name, 10)));
+                } else {
+                    let elapsed = task_start_times
+                        .get(out_path)
+                        .map(|t| t.elapsed().as_secs_f64())
+                        .unwrap_or(0.0);
+                    let elapsed_str = format!("{:.1}s", elapsed);
+                    let prefix_width = console::measure_text_width(&prefix);
+                    let left_width = 2 + prefix_width + 1 + 1 + 1;
+                    let fill_width = term_width.saturating_sub(left_width + elapsed_str.len());
+                    let msg = format!("{:>width$}", elapsed_str, width = fill_width + elapsed_str.len());
+                    pb.set_message(msg);
                 }
             }
         }
@@ -836,7 +875,6 @@ async fn render_loop(
             if !s.stopped_error {
                 for (out_path, task) in &s.tasks {
                     if let Some(pb) = task_bars.get(out_path) {
-                        pb.set_message("");
                         if keep_task_after_finish(task, &root_dir) {
                             pb.finish();
                         } else {

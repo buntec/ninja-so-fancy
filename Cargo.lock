@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "ninja-so-fancy"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "clap",
  "console",
