@@ -701,9 +701,9 @@ async fn render_loop(
             .progress_chars("=> ");
 
     let task_style =
-        ProgressStyle::with_template("  {prefix} {spinner:.cyan} {wide_msg}")
+        ProgressStyle::with_template("  {spinner:.cyan} {prefix} {wide_msg}")
             .unwrap()
-            .tick_strings(&["\u{25cb}", "\u{25d4}", "\u{25d1}", "\u{25d5}", "\u{25cf}"]);
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]);
 
     let overall_pb = mp.add(ProgressBar::new(0));
     overall_pb.set_style(overall_style.clone());
